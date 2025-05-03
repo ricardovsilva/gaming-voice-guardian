@@ -1,15 +1,11 @@
 import sys
-
 import numpy as np
 import sounddevice as sd
-
 from PyQt6.QtWidgets import *
-from PyQt6.QtCore import QTimer
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
-
-
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtGui import QFont, QPalette, QColor
 from configparser import ConfigParser
+import os
 
 
 #
@@ -19,12 +15,10 @@ from configparser import ConfigParser
 # ```````
 
 # TODO
-# store and retrieve settings
 # github workflow setup
 # select input/ouput devices DONE
 # custom sound
 # GUI aestetich improvement
-# graphical trigger feedback
 # bug when closing application DONE
 # max value monitoring
 # automatic gain
@@ -36,8 +30,16 @@ class micMonitorWindow(QMainWindow):
         super().__init__()
         self.isChangedByUser = False
         self.setWindowTitle("Microphone Guardian")
-        self.setGeometry(500, 120, 400, 200)
+        self.setGeometry(500, 120, 400, 250) # Increased height slightly for new checkboxes
 
+        # Store original palette for visual warning reset
+        self.original_palette = self.palette()
+        self.visual_warning_active = False
+        self.visual_warning_timer = QTimer(self)
+        self.visual_warning_timer.setSingleShot(True)
+        self.visual_warning_timer.timeout.connect(self.reset_visual_warning)
+
+        # --- Device Setup ---
         self.inputDevices = [
             device
             for device in sd.query_devices()
@@ -49,74 +51,11 @@ class micMonitorWindow(QMainWindow):
             if (device["max_output_channels"] > 0)
         ]
 
-        self.triggerCheck = QCheckBox("Enable Trigger")
-        self.triggerCheck.setChecked(True)
-
+        # --- Main Tab Widgets ---
         configBoxSize = 50
-
-        self.thresholdSlider = QSlider()
-        self.thresholdSlider.setValue(configBoxSize)
-        self.thresholdSlider.setOrientation(Qt.Orientation.Horizontal)
-        self.thresholdSlider.setBaseSize(0, 0)
-
-        self.thresholdLabel = QLabel("- Trigger Threshold")
-        self.thresholdBox = QLineEdit("50")
-        self.thresholdBox.setMaximumWidth(50)
-
-        self.gainLabel = QLabel("- Mic Sensitivity (Gain)")
-        self.gainBox = QLineEdit("100")
-        self.gainBox.setMaximumWidth(configBoxSize)
-
-        # Options
-        self.frequencyLabel = QLabel("- Frequency (440 Hz is A4)")
-        self.frequencyBox = QLineEdit("500")
-        self.frequencyBox.setMaximumWidth(configBoxSize)
-
-        self.durationLabel = QLabel("- Duration in seconds")
-        self.durationBox = QLineEdit("1")
-        self.durationBox.setMaximumWidth(configBoxSize)
-
-        self.sampleRateLabel = QLabel("- Sample Rate (44100 Hz)")
-        self.sampleRateBox = QLineEdit("44100")
-        self.sampleRateBox.setMaximumWidth(configBoxSize)
-
-        self.amplitudeLabel = QLabel("- Amplitude (0.0 to 1.0)")
-        self.amplitudeBox = QLineEdit("0.75")
-        self.amplitudeBox.setMaximumWidth(configBoxSize)
 
         self.volumeBar = QProgressBar()
         self.volumeBar.setTextVisible(False)
-        self.feedbackLabel = QLabel()
-        self.feedbackLabel.setFixedHeight(10)
-        # self.volumeBar.setOrientation(Qt.Orientation.Vertical)
-        self.inputSelector = QComboBox()
-        self.inputSelector.addItems(
-            [
-                (str(device["index"]).format("%02d", 7) + " " + device["name"])
-                for device in self.inputDevices
-            ]
-        )
-        self.inputSelector.setCurrentText(sd.query_devices()[1]["name"])
-        self.volumeKnob = QDial()
-        self.volumeKnob.setValue(100)
-        self.outputSelector = QComboBox()
-        self.outputSelector.addItems(
-            [
-                (str(device["index"]).format("%02d", 7) + " " + device["name"])
-                for device in self.outputDevices
-            ]
-        )
-        self.outputSelector.setCurrentText(sd.query_devices()[4]["name"])
-        self.outputSelector.currentIndexChanged.connect(self.restartOutput)
-        self.saveMainButton = QPushButton("Save Settings")
-        self.cancelMainButton = QPushButton("Cancel Changes")
-        self.saveOptionsButton = QPushButton("Save Settings")
-        self.cancelOptionsButton = QPushButton("Cancel Changes")
-        # self.optionsCheck = QCheckBox("minimal mode")
-        # self.optionsCheck.checkStateChanged.connect(self.toggleOptions)
-
-        self.inputSelector.currentIndexChanged.connect(self.restartInput)
-
         self.volumeBar.setStyleSheet(
             """
             QProgressBar {
@@ -131,13 +70,16 @@ class micMonitorWindow(QMainWindow):
         """
         )
 
+        self.thresholdSlider = QSlider(Qt.Orientation.Horizontal)
+        self.thresholdSlider.setValue(50)
         self.thresholdSlider.setStyleSheet(
             """
             QSlider::groove:horizontal {
                 height: 0px;
+                background: lightgrey; /* Added background */
             }
             QSlider::handle:horizontal {
-                background-color: blue; 
+                background-color: blue;
                 border: 1px solid black;
                 width: 10px;
                 margin: -5px 0;
@@ -145,134 +87,225 @@ class micMonitorWindow(QMainWindow):
         """
         )
 
+        self.thresholdBox = QLineEdit("50")
+        self.thresholdBox.setMaximumWidth(configBoxSize)
+        self.thresholdLabel = QLabel("- Trigger Threshold")
+
+        self.volumeKnob = QDial()
+        self.volumeKnob.setValue(100)
+
+        self.gainBox = QLineEdit("100")
+        self.gainBox.setMaximumWidth(configBoxSize)
+        self.gainLabel = QLabel("- Mic Sensitivity (Gain)")
+
+        self.triggerCheck = QCheckBox("Enable Trigger")
+        self.triggerCheck.setChecked(True)
+
+        self.muteAudioCheck = QCheckBox("Mute Audio Warning")
+        self.muteAudioCheck.setChecked(False)
+
+        self.enableVisualCheck = QCheckBox("Enable Visual Warning")
+        self.enableVisualCheck.setChecked(True)
+
+        self.saveMainButton = QPushButton("Save Settings")
+        self.cancelMainButton = QPushButton("Cancel Changes")
+
+        self.frequencyLabel = QLabel("- Frequency (Hz)")
+        self.frequencyBox = QLineEdit("440")
+        self.frequencyBox.setMaximumWidth(configBoxSize)
+
+        self.durationLabel = QLabel("- Duration (s)")
+        self.durationBox = QLineEdit("0.5")
+        self.durationBox.setMaximumWidth(configBoxSize)
+
+        self.sampleRateLabel = QLabel("- Sample Rate (Hz)")
+        self.sampleRateBox = QLineEdit("44100")
+        self.sampleRateBox.setMaximumWidth(configBoxSize + 10)
+
+        self.amplitudeLabel = QLabel("- Amplitude (0.0-1.0)")
+        self.amplitudeBox = QLineEdit("0.5")
+        self.amplitudeBox.setMaximumWidth(configBoxSize)
+
+        self.inputSelector = QComboBox()
+        self.inputSelector.addItems(
+            [f"{dev['index']:02d} {dev['name']}" for dev in self.inputDevices]
+        )
+        try:
+            default_input_idx = [i for i, dev in enumerate(self.inputDevices) if dev['index'] == sd.default.device[0]][0]
+            self.inputSelector.setCurrentIndex(default_input_idx)
+        except (IndexError, ValueError):
+            if self.inputDevices:
+                 self.inputSelector.setCurrentIndex(0)
+
+        self.outputSelector = QComboBox()
+        self.outputSelector.addItems(
+            [f"{dev['index']:02d} {dev['name']}" for dev in self.outputDevices]
+        )
+        try:
+            default_output_idx = [i for i, dev in enumerate(self.outputDevices) if dev['index'] == sd.default.device[1]][0]
+            self.outputSelector.setCurrentIndex(default_output_idx)
+        except (IndexError, ValueError):
+             if self.outputDevices:
+                 self.outputSelector.setCurrentIndex(0)
+
+
+        self.saveOptionsButton = QPushButton("Save Settings")
+        self.cancelOptionsButton = QPushButton("Cancel Changes")
+        self.feedbackLabel = QLabel("Status: OK")
+        self.feedbackLabel.setFixedHeight(15)
+
+
         self.parentGrid = QGridLayout()
         gainLayout = QHBoxLayout()
         thresholdLayout = QHBoxLayout()
+        triggerControlLayout = QVBoxLayout()
         self.configLayout = QGridLayout()
 
         gainLayout.addWidget(self.gainBox, 0, Qt.AlignmentFlag.AlignLeft)
-        gainLayout.addWidget(self.gainLabel, 0, Qt.AlignmentFlag.AlignLeft)
+        gainLayout.addWidget(self.gainLabel, 1, Qt.AlignmentFlag.AlignLeft)
 
         thresholdLayout.addWidget(self.thresholdBox, 0, Qt.AlignmentFlag.AlignLeft)
-        thresholdLayout.addWidget(self.thresholdLabel, 0, Qt.AlignmentFlag.AlignLeft)
+        thresholdLayout.addWidget(self.thresholdLabel, 1, Qt.AlignmentFlag.AlignLeft)
 
-        # (arg__1,row,column,rowSpan,columnSpan,alignment)
-        self.parentGrid.addWidget(
-            self.volumeBar, 0, 0, 1, -1, Qt.AlignmentFlag.AlignBaseline
-        )
-        self.parentGrid.addWidget(
-            self.thresholdSlider, 0, 0, 1, -1, Qt.AlignmentFlag.AlignBaseline
-        )
-        self.parentGrid.addWidget(
-            self.volumeKnob, 1, 0, 2, 1, Qt.AlignmentFlag.AlignBaseline
-        )
+        triggerControlLayout.addWidget(self.triggerCheck)
+        triggerControlLayout.addWidget(self.muteAudioCheck)
+        triggerControlLayout.addWidget(self.enableVisualCheck)
+        triggerControlLayout.addStretch() # Push controls to top
 
-        self.parentGrid.addLayout(
-            thresholdLayout, 1, 1, 1, 1, Qt.AlignmentFlag.AlignLeft
-        )
-        self.parentGrid.addLayout(gainLayout, 2, 1, 1, 1, Qt.AlignmentFlag.AlignLeft)
+        # (widget, row, column, rowSpan, columnSpan, alignment)
+        self.parentGrid.addWidget(self.volumeBar, 0, 0, 1, 3)
+        self.parentGrid.addWidget(self.thresholdSlider, 1, 0, 1, 3)
+        self.parentGrid.addWidget(self.volumeKnob, 2, 0, 2, 1)
+        self.parentGrid.addLayout(thresholdLayout, 2, 1)
+        self.parentGrid.addLayout(gainLayout, 3, 1)
+        self.parentGrid.addLayout(triggerControlLayout, 2, 2, 2, 1)
 
-        # self.parentGrid.addWidget(self.feedbackLabel,4,0,1,-1,Qt.AlignmentFlag.AlignJustify)
-        self.parentGrid.addWidget(
-            self.triggerCheck, 1, 2, 1, -1, Qt.AlignmentFlag.AlignRight
-        )
-        self.parentGrid.addWidget(
-            self.saveMainButton, 3, 0, 1, -1, Qt.AlignmentFlag.AlignLeft
-        )
-        self.parentGrid.addWidget(
-            self.cancelMainButton, 3, 2, 1, -1, Qt.AlignmentFlag.AlignRight
-        )
+        mainButtonLayout = QHBoxLayout()
+        mainButtonLayout.addWidget(self.saveMainButton)
+        mainButtonLayout.addStretch()
+        mainButtonLayout.addWidget(self.cancelMainButton)
+        self.parentGrid.addLayout(mainButtonLayout, 4, 0, 1, 3) # Span across bottom
 
         self.configLayout.addWidget(self.frequencyBox, 0, 0)
         self.configLayout.addWidget(self.frequencyLabel, 0, 1)
-
-        self.configLayout.addWidget(self.durationBox, 1, 0)
-        self.configLayout.addWidget(self.durationLabel, 1, 1)
-
         self.configLayout.addWidget(self.sampleRateBox, 0, 2)
         self.configLayout.addWidget(self.sampleRateLabel, 0, 3)
 
+        self.configLayout.addWidget(self.durationBox, 1, 0)
+        self.configLayout.addWidget(self.durationLabel, 1, 1)
         self.configLayout.addWidget(self.amplitudeBox, 1, 2)
         self.configLayout.addWidget(self.amplitudeLabel, 1, 3)
 
-        self.configLayout.addWidget(
-            self.inputSelector, 2, 0, 1, -1, Qt.AlignmentFlag.AlignBaseline
-        )
-        self.configLayout.addWidget(
-            self.outputSelector, 3, 0, 1, -1, Qt.AlignmentFlag.AlignBaseline
-        )
-        self.configLayout.addWidget(
-            self.saveOptionsButton, 4, 0, 1, -1, Qt.AlignmentFlag.AlignLeft
-        )
-        self.configLayout.addWidget(
-            self.cancelOptionsButton, 4, 2, 1, -1, Qt.AlignmentFlag.AlignRight
-        )
+        self.configLayout.addWidget(QLabel("Input Device:"), 2, 0, 1, 4)
+        self.configLayout.addWidget(self.inputSelector, 3, 0, 1, 4)
+        self.configLayout.addWidget(QLabel("Output Device:"), 4, 0, 1, 4)
+        self.configLayout.addWidget(self.outputSelector, 5, 0, 1, 4)
 
-        # self.freq, self.duration, self.samplerate,self.amplitude
+        optionsButtonLayout = QHBoxLayout()
+        optionsButtonLayout.addWidget(self.saveOptionsButton)
+        optionsButtonLayout.addStretch()
+        optionsButtonLayout.addWidget(self.cancelOptionsButton)
+        self.configLayout.addLayout(optionsButtonLayout, 6, 0, 1, 4)
+        self.configLayout.setRowStretch(7, 1) # Push content up
 
+        # --- Tabs ---
+        self.tab_widget = QTabWidget()
+        self.mainTab = QWidget()
+        self.optionsTab = QWidget()
+
+        self.mainTab.setLayout(self.parentGrid)
+        self.optionsTab.setLayout(self.configLayout)
+
+        self.tab_widget.addTab(self.mainTab, "Main")
+        self.tab_widget.addTab(self.optionsTab, "Options")
+
+        # Central Layout with Feedback Label
+        centralWidget = QWidget()
+        centralLayout = QVBoxLayout(centralWidget)
+        centralLayout.addWidget(self.tab_widget)
+        centralLayout.addWidget(self.feedbackLabel)
+        self.setCentralWidget(centralWidget)
+
+
+        # --- Connections ---
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.UpdateProgressBar)
-        self.timer.start()
-        self.timer.setInterval(50)
+        self.timer.setInterval(50) # ~20 FPS update
 
-        self.frequencyBox.textEdited.connect(self.UpdateOptions)
-        self.durationBox.textEdited.connect(self.UpdateOptions)
-        self.sampleRateBox.textEdited.connect(self.UpdateOptions)
-        self.amplitudeBox.textEdited.connect(self.UpdateOptions)
+        self.frequencyBox.textEdited.connect(self.options_changed)
+        self.durationBox.textEdited.connect(self.options_changed)
+        self.sampleRateBox.textEdited.connect(self.options_changed)
+        self.amplitudeBox.textEdited.connect(self.options_changed)
 
         self.volumeKnob.valueChanged.connect(self.setGainBox)
         self.gainBox.textEdited.connect(self.setVolumeKnob)
         self.thresholdSlider.valueChanged.connect(self.setThresholdBox)
         self.thresholdBox.textEdited.connect(self.setThresholdSlider)
 
+        # Connect new checkboxes to setChanged
+        self.triggerCheck.stateChanged.connect(lambda: self.setChanged(True))
+        self.muteAudioCheck.stateChanged.connect(lambda: self.setChanged(True))
+        self.enableVisualCheck.stateChanged.connect(lambda: self.setChanged(True))
+
         self.saveMainButton.clicked.connect(self.updateConfigs)
         self.saveOptionsButton.clicked.connect(self.updateConfigs)
 
         self.cancelMainButton.clicked.connect(self.retrieveConfigs)
         self.cancelOptionsButton.clicked.connect(self.retrieveConfigs)
-        self.setChanged(False)
 
-        self.tab_widget = QTabWidget()
+        self.inputSelector.currentIndexChanged.connect(self.restartInput)
+        self.outputSelector.currentIndexChanged.connect(self.restartOutput)
 
-        self.mainTab = QWidget()
-        self.optionsTab = QWidget()
-
-        self.tab_widget.addTab(self.mainTab, "Main")
-        self.tab_widget.addTab(self.optionsTab, "Options")
-        self.mainTab.setLayout(self.parentGrid)
-        self.optionsTab.setLayout(self.configLayout)
-
-        self.setCentralWidget(self.tab_widget)
-
+        # --- Initialization ---
+        self.volume_level = 0 # Initialize volume level
         self.iniPath = "config.ini"
-        # Start the audio stream
-        self.stream = sd.InputStream(callback=self.ListenToMic)
-        self.restartInput()
+        self.stream = None
         self.retrieveConfigs()
-
-        self.isChangedByUser = False
         self.UpdateOptions()
-        self.isChangedByUser = (
-            True  # any future changes triggered will be from a user action
-        )
+        self.restartInput()
+        self.timer.start()
+
+        self.isChangedByUser = True # Any future changes are user-initiated
+        self.setChanged(False) # Start with buttons disabled
+
 
     def setChanged(self, isChanged):
-        self.saveMainButton.setDisabled(not isChanged)
-        self.saveOptionsButton.setDisabled(not isChanged)
-        self.cancelMainButton.setDisabled(not isChanged)
-        self.cancelOptionsButton.setDisabled(not isChanged)
+        if not self.isChangedByUser and isChanged:
+            return
+        self.saveMainButton.setEnabled(isChanged)
+        self.saveOptionsButton.setEnabled(isChanged)
+        self.cancelMainButton.setEnabled(isChanged)
+        self.cancelOptionsButton.setEnabled(isChanged)
 
     def setThresholdSlider(self):
-        self.thresholdSlider.setValue(int(self.thresholdBox.text()))
-        self.setChanged(True)
+        """Update slider when threshold text box is edited."""
+        try:
+            value = int(self.thresholdBox.text())
+            if 0 <= value <= 100:
+                self.thresholdSlider.setValue(value)
+                self.thresholdBox.setStyleSheet("")
+                self.setChanged(True)
+            else:
+                self.thresholdBox.setStyleSheet("color: red;")
+        except ValueError:
+            self.thresholdBox.setStyleSheet("color: red;")
+
 
     def setThresholdBox(self):
         self.thresholdBox.setText(str(self.thresholdSlider.value()))
         self.setChanged(True)
 
     def setVolumeKnob(self):
-        self.volumeKnob.setValue(int(self.gainBox.text()))
-        self.setChanged(True)
+        try:
+            value = int(self.gainBox.text())
+            if 0 <= value <= 100:
+                self.volumeKnob.setValue(value)
+                self.gainBox.setStyleSheet("")
+                self.setChanged(True)
+            else:
+                 self.gainBox.setStyleSheet("color: red;")
+        except ValueError:
+            self.gainBox.setStyleSheet("color: red;")
 
     def setGainBox(self):
         self.gainBox.setText(str(self.volumeKnob.value()))
@@ -280,7 +313,9 @@ class micMonitorWindow(QMainWindow):
 
     def updateConfigs(self):
         config = ConfigParser()
-        config.read(self.iniPath)
+        if os.path.exists(self.iniPath):
+             config.read(self.iniPath)
+
         if not config.has_section("main"):
             config.add_section("main")
         if not config.has_section("options"):
@@ -291,169 +326,286 @@ class micMonitorWindow(QMainWindow):
         config.set("main", "gainBox", self.gainBox.text())
         config.set("main", "thresholdBox", self.thresholdBox.text())
         config.set("main", "triggerCheck", str(self.triggerCheck.isChecked()))
+        config.set("main", "muteAudioCheck", str(self.muteAudioCheck.isChecked()))
+        config.set("main", "enableVisualCheck", str(self.enableVisualCheck.isChecked()))
 
-        config.set("options", "frequencyBox", self.frequencyBox.text())
-        config.set("options", "durationBox", self.durationBox.text())
-        config.set("options", "sampleRateBox", self.sampleRateBox.text())
-        config.set("options", "amplitudeBox", self.amplitudeBox.text())
+        try:
+            int(self.frequencyBox.text())
+            config.set("options", "frequencyBox", self.frequencyBox.text())
+        except ValueError: pass
+        try:
+            float(self.durationBox.text())
+            config.set("options", "durationBox", self.durationBox.text())
+        except ValueError: pass
+        try:
+            int(self.sampleRateBox.text())
+            config.set("options", "sampleRateBox", self.sampleRateBox.text())
+        except ValueError: pass
+        try:
+            amp = float(self.amplitudeBox.text())
+            if 0.0 <= amp <= 1.0:
+                 config.set("options", "amplitudeBox", self.amplitudeBox.text())
+        except ValueError: pass
+
 
         config.set("devices", "inputSelector", self.inputSelector.currentText())
         config.set("devices", "outputSelector", self.outputSelector.currentText())
 
-        with open(self.iniPath, "w") as f:
-            config.write(f)
+        try:
+            with open(self.iniPath, "w") as f:
+                config.write(f)
+            self.feedbackLabel.setText("Status: Settings saved.")
+            self.setChanged(False)
+        except IOError as e:
+            self.feedbackLabel.setText(f"Error saving config: {e}")
 
-        self.setChanged(False)
 
     def retrieveConfigs(self):
+        """Load settings from config.ini into the UI."""
+        self.isChangedByUser = False # Prevent triggering setChanged during load
         config = ConfigParser()
-        config.read(self.iniPath)
 
-        self.isChangedByUser = False
+        if not os.path.exists(self.iniPath):
+             self.feedbackLabel.setText("Status: config.ini not found, using defaults.")
+             self.volumeKnob.setValue(100)
+             self.thresholdSlider.setValue(50)
+             self.gainBox.setText("100")
+             self.thresholdBox.setText("50")
+             self.triggerCheck.setChecked(True)
+             self.muteAudioCheck.setChecked(False)
+             self.enableVisualCheck.setChecked(True)
+             self.frequencyBox.setText("440")
+             self.durationBox.setText("0.5")
+             self.sampleRateBox.setText("44100")
+             self.amplitudeBox.setText("0.5")
+        else:
+            config.read(self.iniPath)
+            self.feedbackLabel.setText("Status: Settings loaded.")
 
-        self.volumeKnob.setValue(int(config.get("main", "gainBox", fallback="100")))
-        self.thresholdSlider.setValue(
-            int(config.get("main", "thresholdBox", fallback="50"))
-        )
-        self.gainBox.setText(config.get("main", "gainBox", fallback="100"))
-        self.thresholdBox.setText(config.get("main", "thresholdBox", fallback="50"))
-        self.triggerCheck.setChecked(
-            bool(config.get("main", "triggerCheck", fallback="True"))
-        )
+            def get_bool(section, option, fallback=False):
+                val = config.get(section, option, fallback=str(fallback))
+                return val.lower() == 'true'
 
-        self.frequencyBox.setText(config.get("options", "frequencyBox", fallback="440"))
-        self.durationBox.setText(config.get("options", "durationBox", fallback="1"))
-        self.sampleRateBox.setText(
-            config.get("options", "sampleRateBox", fallback="44100")
-        )
-        self.amplitudeBox.setText(
-            config.get("options", "amplitudeBox", fallback="0.75")
-        )
+            self.gainBox.setText(config.get("main", "gainBox", fallback="100"))
+            self.setVolumeKnob()
+            self.thresholdBox.setText(config.get("main", "thresholdBox", fallback="50"))
+            self.setThresholdSlider()
+            self.triggerCheck.setChecked(get_bool("main", "triggerCheck", fallback=True))
+            self.muteAudioCheck.setChecked(get_bool("main", "muteAudioCheck", fallback=False))
+            self.enableVisualCheck.setChecked(get_bool("main", "enableVisualCheck", fallback=True))
 
-        self.inputSelector.setCurrentText(
-            config.get("devices", "inputSelector", fallback="")
-        )
-        self.outputSelector.setCurrentText(
-            config.get("devices", "outputSelector", fallback="")
-        )
+            self.frequencyBox.setText(config.get("options", "frequencyBox", fallback="440"))
+            self.durationBox.setText(config.get("options", "durationBox", fallback="0.5"))
+            self.sampleRateBox.setText(config.get("options", "sampleRateBox", fallback="44100"))
+            self.amplitudeBox.setText(config.get("options", "amplitudeBox", fallback="0.5"))
 
-        self.setChanged(False)
-        self.isChangedByUser = True  # Next change would be triggered by a user
+            saved_input = config.get("devices", "inputSelector", fallback="")
+            input_idx = next((i for i, item in enumerate(self.inputSelector.model().stringList()) if item == saved_input), 0)
+            self.inputSelector.setCurrentIndex(input_idx)
 
-    def toggleOptions(self):
-        inverted = not (self.optionsCheck.isChecked())
-        self.inputSelector.setVisible(inverted)
-        self.outputSelector.setVisible(inverted)
-        self.gainBox.setVisible(inverted)
-        # self.debugButton.setVisible(inverted)
-        # self.knob.setVisible(inverted)
-        self.feedbackLabel.setVisible(inverted)
+            saved_output = config.get("devices", "outputSelector", fallback="")
+            output_idx = next((i for i, item in enumerate(self.outputSelector.model().stringList()) if item == saved_output), 0)
+            self.outputSelector.setCurrentIndex(output_idx)
+
+        self.UpdateOptions() 
+        self.setChanged(False) 
+        self.isChangedByUser = True 
+
+    def options_changed(self):
+         """Called when any option text box is edited."""
+         self.UpdateOptions()
+         self.setChanged(True)
+
 
     def restartInput(self):
-        if self.stream.active:
-            self.stream.close()
+        if self.stream and self.stream.active:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception as e:
+                 self.feedbackLabel.setText(f"Error stopping stream: {e}")
+                 print(f"Error stopping stream: {e}")
+
         try:
-            sd.default.device = [
-                int(self.inputSelector.currentText()[0:2]),
-                sd.default.device[1],
-            ]
-            self.stream = sd.InputStream(callback=self.ListenToMic)
+            if self.inputSelector.count() == 0:
+                self.feedbackLabel.setText("Error: No input devices available.")
+                print("Error starting input stream: No input devices available.")
+                self.stream = None
+                return
+
+            device_text = self.inputSelector.currentText()
+            if not device_text or len(device_text) < 2 or not device_text[:2].isdigit():
+                 self.feedbackLabel.setText(f"Error: Invalid device selection '{device_text}'.")
+                 print(f"Error starting input stream: Invalid device selection '{device_text}'.")
+                 self.stream = None
+                 return
+
+            device_index = int(device_text[:2])
+
+            device_index = int(self.inputSelector.currentText()[:2])
+            sd.default.device = (device_index, sd.default.device[1])
+
+            self.stream = sd.InputStream(callback=self.ListenToMic,
+                                        samplerate=self.samplerate,
+                                        device=device_index)
             self.stream.start()
-            self.feedbackLabel.setText("Started")
+            self.feedbackLabel.setText(f"Status: Input stream started on '{self.inputSelector.currentText()}'")
+            if self.isChangedByUser: self.setChanged(True)
+
         except Exception as e:
-            self.feedbackLabel.setText(e)
-            print(e)
+            self.feedbackLabel.setText(f"Error starting input stream: {e}")
+            print(f"Error starting input stream: {e}")
+            self.stream = None
+
 
     def restartOutput(self):
         try:
-            sd.default.device = [
-                sd.default.device[0],
-                int(self.outputSelector.currentText()[0:2]),
-            ]
-            # self.PlayTone()
-            if self.isChangedByUser:
-                self.setChanged(True)
-            else:
-                self.setChanged(False)
+            device_index = int(self.outputSelector.currentText()[:2])
+            sd.default.device = (sd.default.device[0], device_index)
+            self.feedbackLabel.setText(f"Status: Output device set to '{self.outputSelector.currentText()}'")
+            if self.isChangedByUser: self.setChanged(True) 
 
         except Exception as e:
-            self.feedbackLabel.setText(e)
-            print(e)
+            self.feedbackLabel.setText(f"Error setting output device: {e}")
+            print(f"Error setting output device: {e}")
+
 
     def ListenToMic(self, indata, frames, time, status):
-        # Calculate the volume as the norm of the input data
-        self.volume_level = np.linalg.norm(indata) * int(self.gainBox.text())
+        if status:
+            print("Stream status:", status, file=sys.stderr)
+        gain_factor = float(self.gainBox.text()) / 10.0
+        gain_factor = max(0.1, gain_factor)
+
+        rms = np.sqrt(np.mean(indata**2))
+        self.volume_level = rms * gain_factor * 100
 
     def UpdateProgressBar(self):
-        # Update the progress bar with the current volume level
-        self.volumeBar.setValue(min(int(self.volume_level), 100))
+        display_volume = max(0, min(int(self.volume_level), 100))
+        self.volumeBar.setValue(display_volume)
 
-        if (
-            self.volume_level > self.thresholdSlider.value()
-            and self.triggerCheck.isChecked()
-        ):
+        threshold_value = self.thresholdSlider.value()
+        if display_volume > threshold_value:
+             self.volumeBar.setStyleSheet("QProgressBar::chunk { background-color: red; }")
+        else:
+             self.volumeBar.setStyleSheet("QProgressBar::chunk { background-color: green; }")
+
+
+        if self.triggerCheck.isChecked() and self.volume_level > threshold_value:
             self.Trigger()
 
-    def UpdateOptions(self):
-        # check to see if action was by a user or loading
-        if self.isChangedByUser:
-            self.setChanged(True)
-        else:
-            self.setChanged(False)
 
+    def UpdateOptions(self):
+        valid_options = True
         try:
             self.freq = int(self.frequencyBox.text())
-            self.frequencyBox.setStyleSheet("color: blue;")
+            self.frequencyBox.setStyleSheet("") 
         except ValueError:
             self.frequencyBox.setStyleSheet("color: red;")
+            valid_options = False
 
         try:
             self.duration = float(self.durationBox.text())
-            self.durationBox.setStyleSheet("color: blue;")
+            if self.duration <= 0: raise ValueError("Duration must be positive")
+            self.durationBox.setStyleSheet("")
         except ValueError:
             self.durationBox.setStyleSheet("color: red;")
+            valid_options = False
 
         try:
-            self.samplerate = int(self.sampleRateBox.text())
-            self.sampleRateBox.setStyleSheet("color: blue;")
+            new_samplerate = int(self.sampleRateBox.text())
+            if new_samplerate <= 0: raise ValueError("Sample rate must be positive")
+            if hasattr(self, 'samplerate') and self.samplerate != new_samplerate:
+                 self.samplerate = new_samplerate
+                 self.sampleRateBox.setStyleSheet("")
+                 self.restartInput()
+            elif not hasattr(self, 'samplerate'):
+                 self.samplerate = new_samplerate
+                 self.sampleRateBox.setStyleSheet("")
+            else:
+                 self.sampleRateBox.setStyleSheet("")
         except ValueError:
             self.sampleRateBox.setStyleSheet("color: red;")
+            valid_options = False
 
         try:
             self.amplitude = float(self.amplitudeBox.text())
-            self.amplitudeBox.setStyleSheet("color: blue;")
+            if not (0.0 <= self.amplitude <= 1.0): raise ValueError("Amplitude must be between 0.0 and 1.0")
+            self.amplitudeBox.setStyleSheet("")
         except ValueError:
             self.amplitudeBox.setStyleSheet("color: red;")
+            valid_options = False
+
+        return valid_options
+
 
     def Trigger(self):
-        self.PlayTone(self.freq, self.duration, self.samplerate, self.amplitude)
+        if not hasattr(self, 'freq'):
+             if not self.UpdateOptions():
+                  self.feedbackLabel.setText("Error: Invalid audio options for trigger.")
+                  return
 
-    def PlayTone(self, freq=500, duration=1, samplerate=44100, amplitude=0.75):
+        if not self.muteAudioCheck.isChecked():
+            try:
+                 self.PlayTone(self.freq, self.duration, self.samplerate, self.amplitude)
+            except Exception as e:
+                 self.feedbackLabel.setText(f"Error playing tone: {e}")
+                 print(f"Error playing tone: {e}")
+
+        if self.enableVisualCheck.isChecked():
+            self.ShowVisualWarning()
+
+    
+    def ShowVisualWarning(self):
+        """Flashes the window background red temporarily."""
+        if not self.visual_warning_active:
+            self.visual_warning_active = True
+            palette = self.palette()
+            palette.setColor(QPalette.ColorRole.Window, QColor('red'))
+            self.setPalette(palette)
+            self.setAutoFillBackground(True)
+
+            self.visual_warning_timer.start(300)
+
+    def reset_visual_warning(self):
+        """Resets the window background to its original color."""
+        self.setPalette(self.original_palette)
+        self.setAutoFillBackground(False)
+        self.visual_warning_active = False
+
+
+    def PlayTone(self, freq=440, duration=0.5, samplerate=44100, amplitude=0.5):
         """
         Play a sine wave tone. (by GPT)
 
         Parameters:
-        - frequency: Frequency of the sine wave in Hz (default: 440 Hz, which is A4 note).
+        - freq: Frequency of the sine wave in Hz (default: 440 Hz, which is A4 note).
         - duration: Duration of the tone in seconds (default: 1 second).
         - samplerate: Sampling rate in samples per second (default: 44100 Hz).
         - amplitude: Amplitude of the wave (default: 0.5, range: 0.0 to 1.0).
         """
-        # Generate time points
-        t = np.linspace(0, duration, int(samplerate * duration), endpoint=False)
 
-        # Generate sine wave
-        wave = amplitude * np.sin(2 * np.pi * freq * t)
+        try:
+             # Generate time points
+             t = np.linspace(0, duration, int(samplerate * duration), endpoint=False)
+             # Generate sine wave
+             wave = amplitude * np.sin(2 * np.pi * freq * t)
+             # Play the sound on the selected output device
+             sd.play(wave, samplerate, blocking=False) # Use non-blocking play
+             # sd.wait() # Don't wait here, allows GUI to remain responsive
+        except Exception as e:
+            self.feedbackLabel.setText(f"Error in PlayTone: {e}")
+            print(f"Error in PlayTone: {e}")
 
-        # Play the sound
-        sd.play(wave, samplerate)
-        sd.wait()  # Wait until the sound has finished playing
+    def closeEvent(self, event):
+        if self.stream and self.stream.active:
+            self.stream.stop()
+            self.stream.close()
+            print("Audio stream closed.")
+        event.accept()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    font = QFont("Aptos", 10)
-    app.setFont(font)
     listenerWindow = micMonitorWindow()
     listenerWindow.show()
-    app.exec()
-    listenerWindow.stream.close()
+    sys.exit(app.exec())
