@@ -18,8 +18,8 @@ DEFAULTS = {
         "amplitudeBox": "0.5"
     },
     "devices": {
-        "inputSelector": "",
-        "outputSelector": ""
+        "inputDevice": "",
+        "outputDevice": ""
     },
     "visual": {
         "enableVisualCheck": "True",

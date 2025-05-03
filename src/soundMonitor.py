@@ -1,479 +1,552 @@
 import sys
 import numpy as np
 import sounddevice as sd
-from PyQt6.QtWidgets import *
-from PyQt6.QtCore import QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QPalette, QColor
-import os
-
-from visualWarning import VisualWarningTab # Now inherits QWidget
-import configHandler
+from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                             QLabel, QTabWidget, QPushButton, QMessageBox, QApplication)
+from PyQt6.QtCore import pyqtSignal
 import traceback
 
-class micMonitorWindow(QMainWindow):
-    # Define a signal that will be emitted from the audio thread
-    warning_needed = pyqtSignal()
-    
-    def __init__(self):
-        super().__init__()
-        self.isChangedByUser = False
-        self.setWindowTitle("Microphone Guardian")
-        self.setGeometry(500, 120, 400, 280)
+# Import Setup Utilities
+from appSetup import discover_audio_devices, load_initial_configuration
 
-        # --- Device Setup (Before Handler) ---
-        try:
-            all_devices = sd.query_devices()
-            self.inputDevices = [dev for dev in all_devices if dev["max_input_channels"] > 0]
-            self.outputDevices = [dev for dev in all_devices if dev["max_output_channels"] > 0]
-        except Exception as e:
-            print(f"Error querying audio devices: {e}")
-            QMessageBox.critical(self, "Audio Device Error", f"Could not query audio devices: {e}")
+# Import Tabs
+from tabs.mainTab import MainTab
+from tabs.visualWarningTab import VisualWarningTab
+from tabs.optionsTab import OptionsTab
+import configHandler
+
+
+class micMonitorWindow(QMainWindow):
+    """
+    Main application window for the Microphone Guardian.
+
+    Manages the overall UI structure including tabs for different settings,
+    handles audio stream setup and processing, coordinates interactions
+    between tabs, and manages configuration loading/saving. Delegates device
+    change handling to the OptionsTab.
+    """
+    warning_needed = pyqtSignal()
+    volume_level_updated = pyqtSignal(int) # Signal to safely pass volume level
+
+    def __init__(self):
+        """
+        Initializes the main window, sets up UI components, loads configuration,
+        initializes audio devices, connects signals, and starts the audio stream.
+        """
+        super().__init__()
+        self._is_programmatic_change = False
+        self.setWindowTitle("Microphone Guardian")
+        self.setGeometry(500, 120, 400, 300)
+
+        # --- Internal State ---
+        self.stream = None
+        self.current_audio_options = {}
+        self._current_gain = 100
+        self._current_threshold = 50
+        self._trigger_enabled = True
+        self._mute_enabled = False
+        self.samplerate = 0
+        self.amplitude = 0
+        self.frequency = 0
+        self.duration = 0
+
+        # --- Device Discovery ---
+        self.inputDevices, self.outputDevices, device_error = discover_audio_devices()
+        if device_error:
+            QMessageBox.critical(self, "Audio Device Error", device_error)
             self.inputDevices = []
             self.outputDevices = []
 
-        # --- Load Config FIRST (to pass to handler) ---
-        loaded_data = configHandler.load_config()
-        initial_settings = loaded_data.get('settings', {})
-        initial_visual_settings = initial_settings.get('visual', {})
+        # --- Load Configuration ---
+        config_bundle = load_initial_configuration()
+        initial_main_settings = config_bundle['main']
+        initial_visual_settings = config_bundle['visual']
+        initial_options_settings = config_bundle['options']
+        initial_devices_settings = config_bundle['devices']
+        status_message = config_bundle['status_message']
 
+        # --- Instantiate Tab Widgets ---
+        self.mainTab = MainTab(configData=initial_main_settings, parent=self)
         self.visualWarningTab = VisualWarningTab(
             targetWidget=self,
             configData=initial_visual_settings,
             parent=self
         )
-
-        # --- Main Tab Widgets ---
-        configBoxSize = 50
-        self.volumeBar = QProgressBar()
-        self.volumeBar.setTextVisible(False)
-        self.volumeBar.setStyleSheet(
-            """
-            QProgressBar { border: 1px solid grey; border-radius: 1px; text-align: center; }
-            QProgressBar::chunk { background-color: green; }
-            """
+        self.optionsTab = OptionsTab(
+            inputDevices=self.inputDevices,
+            outputDevices=self.outputDevices,
+            configData={'options': initial_options_settings, 'devices': initial_devices_settings},
+            parent=self
         )
-        self.thresholdSlider = QSlider(Qt.Orientation.Horizontal)
-        self.thresholdSlider.setStyleSheet(
-            """
-            QSlider::groove:horizontal { border: 1px solid #bbb; background: #ddd; height: 8px; border-radius: 4px; }
-            QSlider::sub-page:horizontal { background: #66c2ff; border: 1px solid #44a4ee; height: 8px; border-radius: 4px; }
-            QSlider::add-page:horizontal { background: #ddd; border: 1px solid #bbb; height: 8px; border-radius: 4px; }
-            QSlider::handle:horizontal { background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #eee, stop:1 #ccc); border: 1px solid #777; width: 16px; margin: -4px 0; border-radius: 8px; }
-            """
-        )
-        self.thresholdBox = QLineEdit()
-        self.thresholdBox.setMaximumWidth(configBoxSize)
-        self.thresholdLabel = QLabel("- Trigger Threshold")
-        self.volumeKnob = QDial()
-        self.gainBox = QLineEdit()
-        self.gainBox.setMaximumWidth(configBoxSize)
-        self.gainLabel = QLabel("- Mic Sensitivity (Gain)")
-        self.triggerCheck = QCheckBox("Enable Trigger")
-        self.muteAudioCheck = QCheckBox("Mute Audio Warning")
-
-        # --- Options Tab Widgets ---
-        # ... (Options Tab Widget setup remains the same) ...
-        self.frequencyLabel = QLabel("- Frequency (Hz)")
-        self.frequencyBox = QLineEdit()
-        self.frequencyBox.setMaximumWidth(configBoxSize)
-        self.durationLabel = QLabel("- Duration (s)")
-        self.durationBox = QLineEdit()
-        self.durationBox.setMaximumWidth(configBoxSize)
-        self.sampleRateLabel = QLabel("- Sample Rate (Hz)")
-        self.sampleRateBox = QLineEdit()
-        self.sampleRateBox.setMaximumWidth(configBoxSize + 10)
-        self.amplitudeLabel = QLabel("- Amplitude (0.0-1.0)")
-        self.amplitudeBox = QLineEdit()
-        self.amplitudeBox.setMaximumWidth(configBoxSize)
-        self.inputSelector = QComboBox()
-        self.inputSelector.addItems([f"{dev['index']:02d} {dev['name']}" for dev in self.inputDevices])
-        self.outputSelector = QComboBox()
-        self.outputSelector.addItems([f"{dev['index']:02d} {dev['name']}" for dev in self.outputDevices])
 
         # --- Status Label ---
-        self.feedbackLabel = QLabel(loaded_data.get('message', 'Status: Error loading config.')) # Use initial load message
+        self.feedbackLabel = QLabel(status_message)
         self.feedbackLabel.setFixedHeight(15)
 
-        # --- Layouts ---
-        # Main Tab Layout
-        self.mainLayout = QGridLayout()
-        # ... (Main layout setup remains the same) ...
-        gainLayout = QHBoxLayout()
-        thresholdLayout = QHBoxLayout()
-        triggerControlLayout = QVBoxLayout()
-        gainLayout.addWidget(self.gainBox, 0, Qt.AlignmentFlag.AlignLeft)
-        gainLayout.addWidget(self.gainLabel, 1, Qt.AlignmentFlag.AlignLeft)
-        thresholdLayout.addWidget(self.thresholdBox, 0, Qt.AlignmentFlag.AlignLeft)
-        thresholdLayout.addWidget(self.thresholdLabel, 1, Qt.AlignmentFlag.AlignLeft)
-        triggerControlLayout.addWidget(self.triggerCheck)
-        triggerControlLayout.addWidget(self.muteAudioCheck)
-        triggerControlLayout.addStretch()
-        self.mainLayout.addWidget(self.volumeBar, 0, 0, 1, 3)
-        self.mainLayout.addWidget(self.thresholdSlider, 1, 0, 1, 3)
-        self.mainLayout.addWidget(self.volumeKnob, 2, 0, 2, 1)
-        self.mainLayout.addLayout(thresholdLayout, 2, 1)
-        self.mainLayout.addLayout(gainLayout, 3, 1)
-        self.mainLayout.addLayout(triggerControlLayout, 2, 2, 2, 1)
-
-        # Options Tab Layout
-        self.optionsLayout = QGridLayout()
-        # ... (Options layout setup remains the same) ...
-        self.optionsLayout.addWidget(self.frequencyBox, 0, 0)
-        self.optionsLayout.addWidget(self.frequencyLabel, 0, 1)
-        self.optionsLayout.addWidget(self.sampleRateBox, 0, 2)
-        self.optionsLayout.addWidget(self.sampleRateLabel, 0, 3)
-        self.optionsLayout.addWidget(self.durationBox, 1, 0)
-        self.optionsLayout.addWidget(self.durationLabel, 1, 1)
-        self.optionsLayout.addWidget(self.amplitudeBox, 1, 2)
-        self.optionsLayout.addWidget(self.amplitudeLabel, 1, 3)
-        self.optionsLayout.addWidget(QLabel("Input Device:"), 2, 0, 1, 4)
-        self.optionsLayout.addWidget(self.inputSelector, 3, 0, 1, 4)
-        self.optionsLayout.addWidget(QLabel("Output Device:"), 4, 0, 1, 4)
-        self.optionsLayout.addWidget(self.outputSelector, 5, 0, 1, 4)
-        self.optionsLayout.setRowStretch(7, 1)
-
-
-        # --- Tabs ---
+        # --- Tabs Setup ---
         self.tab_widget = QTabWidget()
-        self.mainTab = QWidget()
-        self.optionsTab = QWidget()
-
-        self.mainTab.setLayout(self.mainLayout)
-        self.optionsTab.setLayout(self.optionsLayout)
-
         self.tab_widget.addTab(self.mainTab, "Main")
         self.tab_widget.addTab(self.optionsTab, "Options")
-        # Add the handler instance directly (it's a QWidget now)
         self.tab_widget.addTab(self.visualWarningTab, "Visual Warning")
 
-        # Central Layout
+        # --- Main Layout ---
         centralWidget = QWidget()
         centralLayout = QVBoxLayout(centralWidget)
         centralLayout.addWidget(self.tab_widget)
         centralLayout.addWidget(self.feedbackLabel)
-        self.setCentralWidget(centralWidget)
 
         buttonsLayout = QHBoxLayout()
         self.saveButton = QPushButton("Save Settings")
-        buttonsLayout.addStretch()
         self.cancelButton = QPushButton("Cancel Changes")
+        buttonsLayout.addStretch()
         buttonsLayout.addWidget(self.saveButton)
         buttonsLayout.addWidget(self.cancelButton)
         centralLayout.addLayout(buttonsLayout)
 
+        self.setCentralWidget(centralWidget)
+
         # --- Connections ---
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.UpdateProgressBar)
-        
-        # Connect the cross-thread signal to the main thread slot
         self.warning_needed.connect(self.handle_warning_trigger)
+        self.volume_level_updated.connect(self._handle_volume_update)
 
-        self.frequencyBox.textEdited.connect(self.options_changed)
-        self.durationBox.textEdited.connect(self.options_changed)
-        self.sampleRateBox.textEdited.connect(self.options_changed)
-        self.amplitudeBox.textEdited.connect(self.options_changed)
-        self.inputSelector.currentIndexChanged.connect(self.restartInput)
-        self.outputSelector.currentIndexChanged.connect(self.restartOutput)
+        # Connect signals from tabs
+        self.mainTab.settings_changed.connect(lambda: self.setChanged(True))
+        self.mainTab.gain_changed.connect(self._update_thread_safe_params)
+        self.mainTab.threshold_changed.connect(self._update_thread_safe_params)
+        self.mainTab.trigger_enabled_changed.connect(self._update_thread_safe_params)
+        self.mainTab.mute_enabled_changed.connect(self._update_thread_safe_params)
 
-        # Main Tab Connections
-        self.volumeKnob.valueChanged.connect(self.setGainBox)
-        self.gainBox.textEdited.connect(self.setVolumeKnob)
-        self.thresholdSlider.valueChanged.connect(self.setThresholdBox)
-        self.thresholdBox.textEdited.connect(self.setThresholdSlider)
-        self.triggerCheck.stateChanged.connect(lambda: self.setChanged(True))
-        self.muteAudioCheck.stateChanged.connect(lambda: self.setChanged(True))
+        # Connect OptionsTab signals
+        self.optionsTab.options_changed_signal.connect(self.handle_options_changed) # Handles validity and setChanged
+        self.optionsTab.input_device_changed_signal.connect(self.restartInput)
+        # Connect the new status update signal
+        self.optionsTab.status_update_signal.connect(self._update_status_label)
 
-        # Visual Warning Tab Connections
-        # Connect UI changes within the handler to trigger setChanged in the main window
+        # Connect VisualTab signals
         self.visualWarningTab.enable_check.stateChanged.connect(lambda: self.setChanged(True))
-        self.visualWarningTab.flash_duration_input.valueChanged.connect(lambda: self.setChanged(True)) # Simple trigger
+        self.visualWarningTab.flash_duration_input.valueChanged.connect(lambda: self.setChanged(True))
 
-        # Save/Cancel Button Connections (Main and Options)
+        # Connect Buttons
         self.saveButton.clicked.connect(self.updateConfigs)
         self.cancelButton.clicked.connect(self.retrieveConfigs)
 
-        # --- Final Initialization Steps ---
-        self.volume_level = 0
-        self.stream = None
+        # --- Final Initialization ---
+        self._update_thread_safe_params()
 
-        self._apply_initial_settings(initial_settings)
-
-        # Start audio stream if options are valid
-        if not self.UpdateOptions():
-            self.feedbackLabel.setText("Status: Warning - Invalid audio options loaded. Check Options.")
+        is_valid, self.current_audio_options = self.optionsTab.validate_and_get_options()
+        if not is_valid:
+            if config_bundle['load_ok']:
+                 self.feedbackLabel.setText(status_message + " Warning: Invalid audio options.")
+            else:
+                 self.feedbackLabel.setText("Status: Warning - Invalid audio options loaded.")
         else:
-            self.restartInput()
-
-        # Start UI update timer
-        self.timer.start(50)
-        self.isChangedByUser = True # Allow user changes now
-        self.setChanged(False) # Start with buttons disabled
-
-    def _apply_initial_settings(self, settings):
-        """Applies loaded settings to the UI elements (excluding visual handler)."""
-        print("Applying initial settings...")
-        self.isChangedByUser = False # Prevent setChanged during initial apply
-        try:
-            # Main Tab
-            self.gainBox.setText(settings.get('main', {}).get('gainBox', '100'))
-            self.setVolumeKnob()
-            self.thresholdBox.setText(settings.get('main', {}).get('thresholdBox', '50'))
-            self.setThresholdSlider()
-            self.triggerCheck.setChecked(settings.get('main', {}).get('triggerCheck', 'True').lower() == 'true')
-            self.muteAudioCheck.setChecked(settings.get('main', {}).get('muteAudioCheck', 'False').lower() == 'true')
-
-            # Options Tab
-            self.frequencyBox.setText(settings.get('options', {}).get('frequencyBox', '440'))
-            self.durationBox.setText(settings.get('options', {}).get('durationBox', '0.5'))
-            self.sampleRateBox.setText(settings.get('options', {}).get('sampleRateBox', '44100'))
-            self.amplitudeBox.setText(settings.get('options', {}).get('amplitudeBox', '0.5'))
+            self._update_internal_audio_params()
+            # Start stream only if devices were found and options are valid
+            if self.inputDevices:
+                self.restartInput()
+            else:
+                self.feedbackLabel.setText("Status: No input devices found. Cannot start monitoring.")
 
 
-            # Devices Tab
-            # ... (apply device selections as before) ...
-            saved_input = settings.get('devices', {}).get('inputSelector', '')
-            input_idx = self.inputSelector.findText(saved_input) if saved_input else -1
-            if input_idx != -1: self.inputSelector.setCurrentIndex(input_idx)
-            elif self.inputDevices:
-                try:
-                    default_idx_sys = sd.default.device[0]; default_input_text = next((f"{dev['index']:02d} {dev['name']}" for dev in self.inputDevices if dev['index'] == default_idx_sys), None); input_idx_def = self.inputSelector.findText(default_input_text) if default_input_text else 0
-                    if input_idx_def != -1: self.inputSelector.setCurrentIndex(input_idx_def)
-                    else: self.inputSelector.setCurrentIndex(0)
-                except Exception: pass
-                if input_idx == -1 and self.inputSelector.currentIndex() == -1 : self.inputSelector.setCurrentIndex(0)
-            saved_output = settings.get('devices', {}).get('outputSelector', '')
-            output_idx = self.outputSelector.findText(saved_output) if saved_output else -1
-            if output_idx != -1: self.outputSelector.setCurrentIndex(output_idx)
-            elif self.outputDevices:
-                try:
-                    default_idx_sys = sd.default.device[1]; default_output_text = next((f"{dev['index']:02d} {dev['name']}" for dev in self.outputDevices if dev['index'] == default_idx_sys), None); output_idx_def = self.outputSelector.findText(default_output_text) if default_output_text else 0
-                    if output_idx_def != -1: self.outputSelector.setCurrentIndex(output_idx_def)
-                    else: self.outputSelector.setCurrentIndex(0)
-                except Exception: pass
-                if output_idx == -1 and self.outputSelector.currentIndex() == -1 : self.outputSelector.setCurrentIndex(0)
+        self._is_programmatic_change = True
+        self.setChanged(False)
+        self._is_programmatic_change = False
 
-
-            # Visual settings are applied in the handler's __init__ now
-
-        except Exception as e:
-            print(f"Error applying initial settings: {e}\n{traceback.format_exc()}")
-            self.feedbackLabel.setText(f"Status: Error applying settings: {e}")
-        finally:
-             self.isChangedByUser = True # Re-enable after applying
-        print("Finished applying initial settings.")
-
+    def _update_status_label(self, message):
+        """Slot to update the feedback label text."""
+        self.feedbackLabel.setText(message)
 
     def setChanged(self, isChanged):
-        if not self.isChangedByUser and isChanged:
+        """
+        Enables or disables the Save and Cancel buttons based on UI changes.
+
+        Prevents enabling buttons during programmatic changes (e.g., loading config).
+
+        Args:
+            isChanged (bool): True if a user change occurred, False otherwise.
+        """
+        if self._is_programmatic_change and isChanged:
             return
         self.saveButton.setEnabled(isChanged)
         self.cancelButton.setEnabled(isChanged)
 
-
     def updateConfigs(self):
-        """Save current UI settings using config_handler."""
+        """
+        Gathers current settings from all tabs and saves them using configHandler.
+        """
         print("Gathering UI state for saving...")
+        try:
+            main_settings = self.mainTab.get_config_values()
+            visual_settings = self.visualWarningTab.get_config_values()
+            options_settings, devices_settings = self.optionsTab.get_config_values()
 
-        # Get visual settings directly from the handler
-        visual_settings = self.visualWarningTab.get_config_values()
-
-        current_settings = {
-            "main": {
-                "gainBox": self.gainBox.text(),
-                "thresholdBox": self.thresholdBox.text(),
-                "triggerCheck": str(self.triggerCheck.isChecked()),
-                "muteAudioCheck": str(self.muteAudioCheck.isChecked())
-            },
-            "options": {
-                "frequencyBox": self.frequencyBox.text(),
-                "durationBox": self.durationBox.text(),
-                "sampleRateBox": self.sampleRateBox.text(),
-                "amplitudeBox": self.amplitudeBox.text()
-            },
-            "devices": {
-                "inputSelector": self.inputSelector.currentText(),
-                "outputSelector": self.outputSelector.currentText()
-            },
-            "visual": visual_settings # Use the dictionary from the handler
-        }
-        success, message = configHandler.save_config(current_settings)
-        self.feedbackLabel.setText(message)
-        if success:
-            self.setChanged(False)
+            current_settings = {
+                "main": main_settings,
+                "options": options_settings,
+                "devices": devices_settings,
+                "visual": visual_settings
+            }
+            success, message = configHandler.save_config(current_settings)
+            self.feedbackLabel.setText(message)
+            if success:
+                self.setChanged(False)
+        except Exception as e:
+            print(f"Error gathering or saving settings: {e}\n{traceback.format_exc()}")
+            self.feedbackLabel.setText(f"Status: Error saving settings: {e}")
 
 
     def retrieveConfigs(self):
-        """Load settings using config_handler and re-apply them to the UI."""
+        """
+        Loads settings from the configuration file and re-applies them to the UI,
+        effectively cancelling any unsaved user changes.
+        """
         print("Retrieving configuration (Cancel pressed)...")
-        self.isChangedByUser = False # Prevent setChanged during load
+        self._is_programmatic_change = True
 
-        # Load configuration using config_handler
-        loaded_data = configHandler.load_config()
-        settings = loaded_data.get('settings', {})
-        self.feedbackLabel.setText(loaded_data.get('message', 'Status: Error loading config.'))
+        config_bundle = load_initial_configuration()
+        settings = {
+            'main': config_bundle['main'],
+            'visual': config_bundle['visual'],
+            'options': config_bundle['options'],
+            'devices': config_bundle['devices']
+        }
+        self.feedbackLabel.setText(config_bundle['status_message'])
 
-        if not settings:
+        if not config_bundle['load_ok'] and not settings['main'] and not settings['options']:
             print("Error: No settings loaded from config_handler. Cannot apply to UI.")
-            self.isChangedByUser = True
+            self._is_programmatic_change = False
             return
 
-        # --- Apply Settings to UI ---
         try:
-            # Apply Main, Options, Devices settings
-            self._apply_initial_settings(settings)
+            self.mainTab.set_values_from_dict(config_bundle['main'])
+            self.optionsTab.set_values_from_dict(config_bundle['options'], config_bundle['devices'])
 
-            # Apply Visual settings by updating the handler
-            visual_settings = settings.get('visual', {})
+            visual_settings = config_bundle['visual']
             self.visualWarningTab.setEnabled(visual_settings.get('enableVisualCheck', 'True').lower() == 'true')
             try:
                 duration_ms = int(visual_settings.get('flashDurationMs', '300'))
                 self.visualWarningTab.setFlashDuration(duration_ms)
             except (ValueError, TypeError):
-                 self.visualWarningTab.setFlashDuration(300) # Fallback
+                 self.visualWarningTab.setFlashDuration(300)
+
+            is_valid, self.current_audio_options = self.optionsTab.validate_and_get_options()
+            if is_valid:
+                self._update_internal_audio_params()
+                old_samplerate = self.samplerate
+                new_samplerate = self.current_audio_options.get('samplerate', 0)
+                # Restart stream only if devices are available and sample rate changed
+                if self.inputDevices and new_samplerate > 0 and new_samplerate != old_samplerate:
+                    print("Sample rate changed during config reload, restarting input stream.")
+                    self.restartInput()
+                elif not self.inputDevices:
+                     self.feedbackLabel.setText("Status: No input devices found. Cannot start monitoring.")
+
+            else:
+                if config_bundle['load_ok']:
+                     self.feedbackLabel.setText(config_bundle['status_message'] + " Warning: Invalid audio options.")
+                else:
+                     self.feedbackLabel.setText("Status: Warning - Invalid audio options loaded.")
+
+            self._update_thread_safe_params()
 
         except Exception as e:
             print(f"Error applying loaded settings (retrieveConfigs): {e}\n{traceback.format_exc()}")
             self.feedbackLabel.setText(f"Status: Error applying settings: {e}")
         finally:
-            # Ensure buttons reflect loaded state (disabled) AFTER loading
             self.setChanged(False)
-            self.isChangedByUser = True # Re-enable tracking user changes
+            self._is_programmatic_change = False
             print("Finished retrieving configuration (Cancel pressed).")
 
+    def handle_options_changed(self, is_valid):
+        """
+        Handles the options_changed_signal from the OptionsTab.
 
-    def options_changed(self):
-         is_valid = self.UpdateOptions()
-         self.setChanged(True)
-         if not is_valid:
-              self.feedbackLabel.setText("Status: Warning - Invalid audio options entered.")
+        Updates internal audio parameters if the new options are valid and
+        restarts the audio stream if the sample rate has changed. Also enables
+        Save/Cancel buttons.
 
-    def setThresholdSlider(self):
-        try:
-            value = int(self.thresholdBox.text());
-            if 0 <= value <= 100:
-                if self.thresholdSlider.value() != value: self.thresholdSlider.setValue(value)
-                self.thresholdBox.setStyleSheet(""); self.setChanged(True)
-            else: self.thresholdBox.setStyleSheet("color: red;")
-        except ValueError: self.thresholdBox.setStyleSheet("color: red;")
-    def setThresholdBox(self):
-        value = str(self.thresholdSlider.value());
-        if self.thresholdBox.text() != value: self.thresholdBox.setText(value)
-        self.setChanged(True)
-    def setVolumeKnob(self):
-        try:
-            value = int(self.gainBox.text());
-            if 0 <= value <= 100:
-                if self.volumeKnob.value() != value: self.volumeKnob.setValue(value)
-                self.gainBox.setStyleSheet(""); self.setChanged(True)
-            else: self.gainBox.setStyleSheet("color: red;")
-        except ValueError: self.gainBox.setStyleSheet("color: red;")
-    def setGainBox(self):
-        value = str(self.volumeKnob.value());
-        if self.gainBox.text() != value: self.gainBox.setText(value)
-        self.setChanged(True)
-    def restartInput(self):
-        if self.stream and self.stream.active:
-            try: self.stream.stop(); self.stream.close()
-            except Exception as e: print(f"Warning: Error stopping stream: {e}")
-            finally: self.stream = None
-        if not hasattr(self, 'samplerate') or self.samplerate <= 0: return
-        if not self.inputDevices or self.inputSelector.currentIndex() < 0: return
-        device_text = self.inputSelector.currentText();
-        try: device_index = int(device_text[:2])
-        except (ValueError, IndexError): return
-        try:
-            current_output_device_index = sd.default.device[1] if isinstance(sd.default.device, (list, tuple)) and len(sd.default.device) > 1 else (sd.query_devices(kind='output')['index'] if self.outputDevices else None)
-            if current_output_device_index is not None: sd.default.device = (device_index, current_output_device_index)
-            else: sd.default.device = device_index
-            self.stream = sd.InputStream(callback=self.ListenToMic, samplerate=self.samplerate, device=device_index, dtype='float32')
-            self.stream.start(); self.feedbackLabel.setText(f"Status: Monitoring '{self.inputSelector.currentText()}'")
-        except sd.PortAudioError as pae: self.feedbackLabel.setText(f"Status: PortAudio Error - {pae}"); self.stream = None
-        except Exception as e: self.feedbackLabel.setText(f"Status: Error starting stream - {e}"); self.stream = None
-    def restartOutput(self):
-        if not self.outputDevices or self.outputSelector.currentIndex() < 0: return
-        device_text = self.outputSelector.currentText();
-        try: device_index = int(device_text[:2])
-        except (ValueError, IndexError): return
-        try:
-            current_input_device_index = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else (sd.query_devices(kind='input')['index'] if self.inputDevices else None)
-            if current_input_device_index is not None: sd.default.device = (current_input_device_index, device_index)
-            else: sd.default.device = device_index
-            self.feedbackLabel.setText(f"Status: Output device set to '{self.outputSelector.currentText()}'"); self.setChanged(True)
-        except sd.PortAudioError as pae: self.feedbackLabel.setText(f"Status: PortAudio Error setting output - {pae}")
-        except Exception as e: self.feedbackLabel.setText(f"Status: Error setting output - {e}")
-    def ListenToMic(self, indata, frames, time, status):
-        """Callback executed by sounddevice in a background thread."""
-        if status: print(status, file=sys.stderr)
-        try:
-            gain_factor = self.volumeKnob.value() / 100.0; amplified_data = indata * gain_factor
-            volume_norm = np.linalg.norm(amplified_data) * 10; self.volume_level = min(int(volume_norm), 100)
-            # Check trigger condition
-            if self.triggerCheck.isChecked() and self.volume_level >= self.thresholdSlider.value():
-                # Emit the signal INSTEAD of calling TriggerWarning directly
-                self.warning_needed.emit()
-        except Exception as e: print(f"Error in ListenToMic: {e}\n{traceback.format_exc()}", file=sys.stderr)
-    
-    # Slot connected to the warning_needed signal
-    def handle_warning_trigger(self):
-        """This method executes in the main GUI thread."""
-        print("Trigger Received (Main Thread)!")
-        
-        # Play audio warning if not muted
-        if not self.muteAudioCheck.isChecked():
-            try:
-                device_text = self.outputSelector.currentText(); device_index = int(device_text[:2]) if device_text else None
-                if self.amplitude > 0 and self.duration > 0 and self.samplerate > 0:
-                    t = np.linspace(0., self.duration, int(self.samplerate * self.duration), endpoint=False)
-                    waveform = self.amplitude * np.sin(2. * np.pi * self.frequency * t)
-                    sd.play(waveform, self.samplerate, device=device_index, blocking=False)
-                else: print("Warning: Invalid audio parameters for warning sound.")
-            except ValueError: print(f"Error: Invalid output device format ('{device_text}').")
-            except sd.PortAudioError as pae: print(f"PortAudioError playing warning: {pae}")
-            except Exception as e: print(f"Error playing warning: {e}")
-        
-        # Trigger visual warning (Now safe to call from main thread)
-        self.visualWarningTab.trigger()
-    # TriggerWarning method removed as its functionality is now in handle_warning_trigger
-    def UpdateOptions(self):
-        is_valid = True; style_error = "color: red;"; style_ok = ""
-        try: self.frequency = float(self.frequencyBox.text()); self.frequencyBox.setStyleSheet(style_ok)
-        except ValueError: is_valid = False; self.frequencyBox.setStyleSheet(style_error)
-        try: self.duration = float(self.durationBox.text()); self.durationBox.setStyleSheet(style_ok)
-        except ValueError: is_valid = False; self.durationBox.setStyleSheet(style_error)
-        try:
-            sr = int(self.sampleRateBox.text());
-            if sr > 0: self.samplerate = sr; self.sampleRateBox.setStyleSheet(style_ok)
-            else: raise ValueError("Sample rate must be positive")
-        except ValueError: is_valid = False; self.samplerate = 0; self.sampleRateBox.setStyleSheet(style_error)
-        try:
-            amp = float(self.amplitudeBox.text());
-            if 0.0 <= amp <= 1.0: self.amplitude = amp; self.amplitudeBox.setStyleSheet(style_ok)
-            else: raise ValueError("Amplitude must be 0.0-1.0")
-        except ValueError: is_valid = False; self.amplitude = 0; self.amplitudeBox.setStyleSheet(style_error)
-        if not is_valid: print("Invalid options entered.")
-        return is_valid
-    def UpdateProgressBar(self):
-        self.volumeBar.setValue(self.volume_level); threshold = self.thresholdSlider.value()
-        if self.volume_level >= threshold: self.volumeBar.setStyleSheet("QProgressBar::chunk { background-color: red; }")
-        else: self.volumeBar.setStyleSheet("QProgressBar::chunk { background-color: green; }")
-    def closeEvent(self, event):
-        print("Closing application..."); self.timer.stop()
+        Args:
+            is_valid (bool): Indicates whether the audio parameters are valid.
+                             Device changes always emit True.
+        """
+        self.setChanged(True) # Enable Save/Cancel on any change reported by OptionsTab
+
+        if is_valid:
+            is_valid_check, new_options = self.optionsTab.validate_and_get_options()
+            if is_valid_check: # Double check validity before using options
+                 old_samplerate = self.samplerate
+                 self.current_audio_options = new_options
+                 self._update_internal_audio_params()
+                 new_samplerate = self.current_audio_options.get('samplerate', 0)
+
+                 # Restart stream only if sample rate actually changed and devices exist
+                 if self.inputDevices and new_samplerate > 0 and new_samplerate != old_samplerate:
+                     print("Sample rate changed, restarting input stream.")
+                     self.restartInput()
+                 elif not self.inputDevices:
+                      self.feedbackLabel.setText("Status: No input devices found. Cannot restart stream.")
+
+
+    def _update_internal_audio_params(self):
+        """
+        Updates the main window's internal audio parameters (samplerate, amplitude, etc.)
+        based on the currently validated options from the OptionsTab.
+        """
+        if self.current_audio_options:
+            self.samplerate = self.current_audio_options.get('samplerate', self.samplerate)
+            self.amplitude = self.current_audio_options.get('amplitude', 0)
+            self.frequency = self.current_audio_options.get('frequency', 0)
+            self.duration = self.current_audio_options.get('duration', 0)
+            print(f"Internal audio params updated: SR={self.samplerate}, Amp={self.amplitude}, Freq={self.frequency}, Dur={self.duration}")
+
+    def _update_thread_safe_params(self):
+        """
+        Updates the internal, thread-safe copies of gain, threshold, trigger enable,
+        and mute enable status based on the current state of the MainTab.
+        This should be called whenever these values change in the UI.
+        """
+        self._current_gain = self.mainTab.get_gain()
+        self._current_threshold = self.mainTab.get_threshold()
+        self._trigger_enabled = self.mainTab.is_trigger_enabled()
+        self._mute_enabled = self.mainTab.is_mute_enabled()
+
+    def stop_stream(self):
+        """
+        Stops and closes the active audio input stream, if it exists.
+        """
         if self.stream:
             try:
-                if self.stream.active: self.stream.stop()
-                self.stream.close(); print("Audio stream stopped and closed.")
-            except Exception as e: print(f"Error closing audio stream: {e}")
+                if self.stream.active:
+                    self.stream.stop()
+                self.stream.close()
+                print("Audio stream stopped and closed.")
+            except Exception as e:
+                print(f"Warning: Error stopping/closing stream: {e}")
+            finally:
+                self.stream = None
+
+    def restartInput(self):
+        """
+        Stops any existing audio stream and starts a new InputStream
+        using the currently selected input device and sample rate.
+        Includes robust parsing for the device index.
+        """
+        self.stop_stream()
+
+        if self.samplerate <= 0:
+            self.feedbackLabel.setText("Status: Cannot start stream - Invalid Sample Rate.")
+            print("Stream start aborted: Invalid sample rate.")
+            return
+
+        device_text = self.optionsTab.get_selected_input_device_text()
+        if not device_text:
+             self.feedbackLabel.setText("Status: Cannot start stream - No Input Device selected.")
+             print("Stream start aborted: No input device selected.")
+             return
+
+        # Explicitly check for the placeholder text
+        if "No Input Devices Found" in device_text:
+            self.feedbackLabel.setText("Status: Cannot start stream - No Input Device selected/available.")
+            print("Stream start aborted: 'No Input Devices Found' selected.")
+            return
+
+        device_index = -1 # Initialize with invalid index
+        try:
+            # Split at the first colon and take the part before it
+            device_index_str = device_text.split(':', 1)[0].strip()
+            device_index = int(device_index_str)
+        except (ValueError, IndexError, TypeError):
+            # Use the actual device_text in the error message
+            error_msg = f"Status: Error parsing input device index from '{device_text}'."
+            self.feedbackLabel.setText(error_msg)
+            # Log the problematic string and the attempted parse result
+            print(f"Stream start aborted: Invalid device text format. Text='{device_text}', Parsed Index String='{device_index_str if 'device_index_str' in locals() else 'N/A'}'")
+            return
+
+        # Proceed only if device_index is valid (>= 0)
+        if device_index < 0:
+             error_msg = f"Status: Invalid device index ({device_index}) parsed from '{device_text}'."
+             self.feedbackLabel.setText(error_msg)
+             print(f"Stream start aborted: Parsed index {device_index} is invalid.")
+             return
+
+        # --- Start Stream Logic (remains the same) ---
+        try:
+            print(f"Attempting to start input stream on device {device_index} ('{device_text}') with SR={self.samplerate}")
+            current_output_device_index = sd.default.device[1] if isinstance(sd.default.device, (list, tuple)) and len(sd.default.device) > 1 else None
+            if current_output_device_index is None:
+                 try:
+                     default_output_info = sd.query_devices(kind='output')
+                     if default_output_info and isinstance(default_output_info, dict):
+                         current_output_device_index = default_output_info['index']
+                     elif isinstance(default_output_info, list) and default_output_info:
+                         current_output_device_index = default_output_info[0]['index']
+                 except Exception as query_e:
+                     print(f"Could not query default output device index during restart: {query_e}")
+
+            if current_output_device_index is not None:
+                sd.default.device = (device_index, current_output_device_index)
+                print(f"Set sd.default.device to (Input: {device_index}, Output: {current_output_device_index})")
+            else:
+                 sd.default.device = device_index
+                 print(f"Set sd.default.device to input only: {device_index} (Output device index unknown)")
+
+            self.stream = sd.InputStream(
+                callback=self.ListenToMic,
+                samplerate=self.samplerate,
+                device=device_index,
+                dtype='float32'
+            )
+            self.stream.start()
+            self.feedbackLabel.setText(f"Status: Monitoring '{device_text}'")
+            print("Input stream started successfully.")
+
+        except sd.PortAudioError as pae:
+            self.feedbackLabel.setText(f"Status: PortAudio Error starting stream - {pae}")
+            print(f"PortAudioError starting stream: {pae}")
+            self.stream = None
+        except ValueError as ve:
+             self.feedbackLabel.setText(f"Status: Value Error starting stream - {ve}")
+             print(f"ValueError starting stream (invalid device index?): {ve}")
+             self.stream = None
+        except Exception as e:
+            self.feedbackLabel.setText(f"Status: Error starting stream - {e}")
+            print(f"Error starting stream: {e}\n{traceback.format_exc()}")
+            self.stream = None
+
+
+    def ListenToMic(self, indata, frames, time, status):
+        """
+        Audio callback function executed by sounddevice in a separate thread.
+
+        Processes incoming audio data, applies gain, calculates volume level,
+        and checks if the trigger threshold is exceeded. Emits `warning_needed`
+        signal if the threshold is met and triggering is enabled. Emits
+        `volume_level_updated` signal with the calculated level.
+
+        Uses thread-safe copies of gain, threshold, and trigger status
+        (`_current_gain`, `_current_threshold`, `_trigger_enabled`).
+
+        Args:
+            indata (numpy.ndarray): Input audio buffer.
+            frames (int): Number of frames in the buffer.
+            time (CData): Timing information.
+            status (sounddevice.CallbackFlags): Status flags (e.g., overflow).
+        """
+        if status:
+            if status.input_overflow:
+                print("Warning: Input overflow detected", file=sys.stderr)
+            if status.input_underflow:
+                 print("Warning: Input underflow detected", file=sys.stderr)
+
+        try:
+            gain_factor = self._current_gain / 100.0
+            threshold_level = self._current_threshold
+            is_trigger_on = self._trigger_enabled
+
+            amplified_data = indata * gain_factor
+            if np.any(amplified_data):
+                volume_rms = np.sqrt(np.mean(amplified_data**2))
+            else:
+                volume_rms = 0
+
+            scaling_factor = 300
+            calculated_level = min(int(volume_rms * scaling_factor), 100)
+
+            self.volume_level_updated.emit(calculated_level)
+
+            if is_trigger_on and calculated_level >= threshold_level:
+                self.warning_needed.emit()
+
+        except Exception as e:
+            print(f"Error in ListenToMic callback: {e}\n{traceback.format_exc()}", file=sys.stderr)
+
+    def _handle_volume_update(self, level):
+        """
+        Slot executed in the main GUI thread to update the volume level display.
+
+        Calls the MainTab's update method directly.
+
+        Args:
+            level (int): The volume level calculated by the audio callback.
+        """
+        self.mainTab.update_volume_bar(level, self._current_threshold)
+
+
+    def handle_warning_trigger(self):
+        """
+        Slot executed in the main GUI thread when `warning_needed` signal is emitted.
+
+        Plays an audio warning (if not muted and parameters are valid) using the
+        selected output device and triggers the visual warning effect. Uses the
+        thread-safe `_mute_enabled` flag.
+        """
+        if not self._mute_enabled:
+            if self.amplitude > 0 and self.duration > 0 and self.samplerate > 0 and self.frequency > 0:
+                device_text = self.optionsTab.get_selected_output_device_text()
+                device_index = None
+                if device_text and "No Output Devices Found" not in device_text: # Check placeholder
+                    try:
+                        # Use robust parsing for output device index as well
+                        device_index_str = device_text.split(':', 1)[0].strip()
+                        device_index = int(device_index_str)
+                    except (ValueError, IndexError, TypeError):
+                        print(f"Error: Invalid output device format ('{device_text}') for warning sound. Using default.")
+                        device_index = None
+                else:
+                    # Handle case where "No Output Devices Found" is selected or text is invalid
+                    if device_text: print(f"Warning: Cannot play sound on '{device_text}'. Using default output.")
+                    device_index = None
+
+
+                try:
+                    t = np.linspace(0., self.duration, int(self.samplerate * self.duration), endpoint=False)
+                    waveform = self.amplitude * np.sin(2. * np.pi * self.frequency * t, dtype=np.float32)
+                    sd.play(waveform, self.samplerate, device=device_index, blocking=False)
+                except sd.PortAudioError as pae:
+                    print(f"PortAudioError playing warning: {pae}", file=sys.stderr)
+                    self._update_status_label(f"Status: Audio Warning Error - {pae}")
+                except ValueError as ve:
+                     print(f"ValueError playing warning: {ve}", file=sys.stderr)
+                     self._update_status_label(f"Status: Audio Warning Error - {ve}")
+                except Exception as e:
+                    print(f"Error generating or playing warning sound: {e}", file=sys.stderr)
+                    self._update_status_label(f"Status: Audio Warning Error - {e}")
+            else:
+                pass
+
+        self.visualWarningTab.trigger()
+
+
+    def closeEvent(self, event):
+        """
+        Handles the window closing event.
+
+        Stops the audio stream, optionally saves settings if
+        auto-save is enabled, and accepts the close event.
+
+        Args:
+            event (QCloseEvent): The close event object.
+        """
+        print("Closing application...")
+        self.stop_stream()
+        if self.optionsTab.is_auto_save_enabled():
+            print("Auto-saving settings on close...")
+            self.updateConfigs()
+        print("Cleanup finished.")
         event.accept()
 
-# Main Execution
+# __main__ block remains the same...
 if __name__ == "__main__":
     try:
         print("Starting Microphone Guardian...")
         app = QApplication(sys.argv)
         listenerWindow = micMonitorWindow()
         listenerWindow.show()
-        sys.exit(app.exec())
+        exit_code = app.exec()
     except Exception as e:
-        print(f"FATAL ERROR: {e}")
+        print(f"FATAL ERROR during application startup or execution: {e}")
         traceback.print_exc()
-        sys.exit(1)
+        exit_code = 1
+    finally:
+        sys.exit(exit_code)
