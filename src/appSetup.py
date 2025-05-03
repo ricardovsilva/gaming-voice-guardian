@@ -50,7 +50,7 @@ def load_initial_configuration(config_path='config.ini'):
     if config_path:
         loaded_data = configHandler.load_config(ini_path=config_path)
     else:
-        loaded_data = configHandler.load_config() # Use default path
+        loaded_data = configHandler.load_config()
 
     initial_settings = loaded_data.get('settings', {})
     status_message = loaded_data.get('message', 'Status: Error loading config.')

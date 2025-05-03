@@ -15,7 +15,10 @@ DEFAULTS = {
         "frequencyBox": "440",
         "durationBox": "0.5",
         "sampleRateBox": "44100",
-        "amplitudeBox": "0.5"
+        "amplitudeBox": "0.5",
+        "webhookUrl": "",
+        "enableWebhookInterval": "False",
+        "webhookIntervalSeconds": "60"
     },
     "devices": {
         "inputDevice": "",
@@ -36,7 +39,7 @@ def _get_config_value(config, section, option):
             return DEFAULTS[section][option]
         except KeyError:
             print(f"Warning: Missing default and config value for [{section}] {option}")
-            return "" # Ultimate fallback
+            return "" 
 
 def load_config(ini_path=INI_FILENAME):
     """
